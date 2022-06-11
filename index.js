@@ -28,15 +28,9 @@ function createDom(fiber) {
         ? document.createTextNode("")
         : document.createElement(fiber.type)
 
-  // children 被放到了 props 属性里，这里过滤掉 children
-  const isProperty = key => key !== "children"
-
-  Object.keys(fiber.props)
-    .filter(isProperty)
-    // 设置 dom 元素的属性，这里是简化版意思一下，直接赋值
-    .forEach(name => dom[name] = fiber.props[name])
+  updateDom(dom, {}, fiber.props);
   
-    return dom
+  return dom
 }
 
 function render(element, container) {
@@ -124,7 +118,13 @@ function commitRoot() {
 function commitWork(fiber) {
   if (!fiber) return
 
-  const domParent = fiber.parent.dom
+  // 函数组件会没有父 dom 的情况，所以一直往上递归
+  let domParentFiber = fiber.parent
+  while (!domParentFiber.dom) {
+    domParentFiber = domParentFiber.parent
+  }
+  const domParent = domParentFiber.dom
+
   if ( fiber.effectTag === "PLACEMENT" && fiber.dom != null) {
     // 插入新 dom
     domParent.appendChild(fiber.dom)
@@ -137,10 +137,19 @@ function commitWork(fiber) {
     )
   } else if (fiber.effectTag === "DELETION") {
     // 删除 dom
-    domParent.removeChild(fiber.dom)
+    commitDeletion(fiber, domParent)
   }
   commitWork(fiber.child)
   commitWork(fiber.sibling)
+}
+
+// 函数组件没有 dom，需要一直往上递归找父 dom
+function commitDeletion(fiber, domParent) {
+  if (fiber.dom) {
+    domParent.removeChild(fiber.dom)
+  } else {
+    commitDeletion(fiber.child, domParent)
+  }
 }
 
 // 被拆分成的一个一个单元的小任务
@@ -174,12 +183,13 @@ requestIdleCallback(workLoop)
 // 2. 给当前fiber的每一个子元素生成fiber节点
 // 3. 找到要返回的下一个 unitOfWork
 function performUnitOfWork(fiber) {
-  if (!fiber.dom) {
-    fiber.dom = createDom(fiber)
+  const isFunctionComponent =
+    fiber.type instanceof Function
+  if (isFunctionComponent) {
+    updateFunctionComponent(fiber)
+  } else {
+    updateHostComponent(fiber)
   }
-
-  const elements = fiber.props.children
-  reconcileChildren(fiber, elements)
 
   // 下面的操作是返回下一个单元——nextUnitOfWork
   // 1. 优先找child
@@ -198,13 +208,65 @@ function performUnitOfWork(fiber) {
   }
 }
 
+function updateHostComponent(fiber) {
+  if (!fiber.dom) {
+    fiber.dom = createDom(fiber)
+  }
+  reconcileChildren(fiber, fiber.props.children)
+}
+
+let wipFiber = null
+let hookIndex = null
+
+function updateFunctionComponent(fiber) {
+  wipFiber = fiber
+  hookIndex = 0
+  wipFiber.hooks = []
+  // 执行函数组件，返回jsx
+  const children = [fiber.type(fiber.props)]
+  reconcileChildren(fiber, children)
+}
+
+function useState(initial) {
+  const oldFiber = wipFiber.alternate;
+  const oldHook = oldFiber?.hooks && oldFiber.hooks[hookIndex];
+  // 设置新 hook
+  const hook = {
+    state: oldHook ? oldHook.state : initial,
+    queue: [],
+  }
+
+  // 执行老 hook 队列里的 setState 方法
+  const actions = oldHook ? oldHook.queue : []
+  actions.forEach(action => {
+    hook.state = action(hook.state)
+  })
+
+  const setState = action => {
+    hook.queue.push(action)
+    // 设置 nextUnitOfWork，从而在下一次闲时启动更新
+    wipRoot = {
+      dom: currentRoot.dom,
+      props: currentRoot.props,
+      alternate: currentRoot,
+    }
+    nextUnitOfWork = wipRoot
+    deletions = []
+  }
+
+  wipFiber.hooks.push(hook)
+  hookIndex++
+  return [hook.state, setState]
+}
+
+
 function reconcileChildren(wipFiber, elements) {
   let index = 0
   let oldFiber = wipFiber.alternate && wipFiber.alternate.child
   let prevSibling = null
 
-  // 1. 遍历当前fiber的children
-  // 2. 给children里的每个child指定3个指针，分别指向其 父、子、兄弟三个节点
+  // 1. 遍历当前 fiber 的 children
+  // 2. 给 children 里的每个 child 指定 3 个指针，分别指向其 父、子、兄弟三个节点
   while (index < elements.length || oldFiber != null) {
     const element = elements[index]
 
@@ -261,15 +323,21 @@ function reconcileChildren(wipFiber, elements) {
 const Didact = {
   createElement,
   render,
+  useState,
 };
 
-const profile = (
-  <div className="profile">
-    <span className="profile-title">title</span>
-    <h3 className="profile-content">content</h3>
-    我是一段文本
-  </div>
-);
+function Counter() {
+  const [state, setState] = Didact.useState(1)
+  return (
+    <div>
+      <button onClick={() => setState(c => c + 1)}>
+        点击 + 1
+      </button>
+      <p>Count: {state}</p>
+    </div>
+  )
+}
+const profile = <Counter />
 
 const container = document.getElementById("root")
 Didact.render(profile, container)
